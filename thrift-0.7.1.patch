@@ -1,0 +1,145 @@
+From 29992d8362ed1f9f3bd4d8eb0d20c8dd6a6c5de6 Mon Sep 17 00:00:00 2001
+From: "yongkun.wang" <yongkun.wang@mail.rakuten.com>
+Date: Fri, 22 Mar 2013 17:41:36 +0900
+Subject: [PATCH 1/2] buffer io stream and oneway fix
+
+---
+ compiler/cpp/src/generate/t_java_generator.cc      |    4 ++++
+ .../src/org/apache/thrift/ProcessFunction.java     |   14 +++++++++-----
+ .../src/org/apache/thrift/transport/TSocket.java   |    6 ++++--
+ thrift-0.6.1-java-buf-io-stream.patch              |   16 ++++++++++++++++
+ 4 files changed, 33 insertions(+), 7 deletions(-)
+ create mode 100644 thrift-0.6.1-java-buf-io-stream.patch
+
+diff --git a/compiler/cpp/src/generate/t_java_generator.cc b/compiler/cpp/src/generate/t_java_generator.cc
+index f9ed5e2..c9010d3 100644
+--- a/compiler/cpp/src/generate/t_java_generator.cc
++++ b/compiler/cpp/src/generate/t_java_generator.cc
+@@ -2703,6 +2703,10 @@ void t_java_generator::generate_process_function(t_service* tservice,
+   indent(f_service_) << "  return new " << argsname << "();" << endl;
+   indent(f_service_) << "}" << endl << endl;
+ 
++  indent(f_service_) << "protected boolean isOneway() {" << endl;
++  indent(f_service_) << "  return " << ((tfunction->is_oneway())?"true":"false") << ";" << endl;
++  indent(f_service_) << "}" << endl << endl;
++
+   indent(f_service_) << "protected " << resultname << " getResult(I iface, " << argsname << " args) throws org.apache.thrift.TException {" << endl;
+   indent_up();
+   if (!tfunction->is_oneway()) {
+diff --git a/lib/java/src/org/apache/thrift/ProcessFunction.java b/lib/java/src/org/apache/thrift/ProcessFunction.java
+index e0cdc7b..34114b0 100644
+--- a/lib/java/src/org/apache/thrift/ProcessFunction.java
++++ b/lib/java/src/org/apache/thrift/ProcessFunction.java
+@@ -30,12 +30,16 @@ public abstract class ProcessFunction<I, T extends TBase> {
+     }
+     iprot.readMessageEnd();
+     TBase result = getResult(iface, args);
+-    oprot.writeMessageBegin(new TMessage(getMethodName(), TMessageType.REPLY, seqid));
+-    result.write(oprot);
+-    oprot.writeMessageEnd();
+-    oprot.getTransport().flush();
++    if ( ! isOneway() ) {
++      oprot.writeMessageBegin(new TMessage(getMethodName(), TMessageType.REPLY, seqid));
++      result.write(oprot);
++      oprot.writeMessageEnd();
++      oprot.getTransport().flush();
++    }
+   }
+ 
++  protected abstract boolean isOneway();
++
+   protected abstract TBase getResult(I iface, T args) throws TException;
+ 
+   protected abstract T getEmptyArgsInstance();
+@@ -43,4 +47,4 @@ public abstract class ProcessFunction<I, T extends TBase> {
+   public String getMethodName() {
+     return methodName;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/lib/java/src/org/apache/thrift/transport/TSocket.java b/lib/java/src/org/apache/thrift/transport/TSocket.java
+index 6dd9efa..37ab98a 100644
+--- a/lib/java/src/org/apache/thrift/transport/TSocket.java
++++ b/lib/java/src/org/apache/thrift/transport/TSocket.java
+@@ -23,6 +23,8 @@ import java.io.IOException;
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.net.SocketException;
++import java.io.BufferedInputStream;
++import java.io.BufferedOutputStream;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -72,8 +74,8 @@ public class TSocket extends TIOStreamTransport {
+ 
+     if (isOpen()) {
+       try {
+-        inputStream_ = socket_.getInputStream();
+-        outputStream_ = socket_.getOutputStream();
++        inputStream_ = new BufferedInputStream(socket_.getInputStream());
++        outputStream_ = new BufferedOutputStream(socket_.getOutputStream());
+       } catch (IOException iox) {
+         close();
+         throw new TTransportException(TTransportException.NOT_OPEN, iox);
+diff --git a/thrift-0.6.1-java-buf-io-stream.patch b/thrift-0.6.1-java-buf-io-stream.patch
+new file mode 100644
+index 0000000..76823a2
+--- /dev/null
++++ b/thrift-0.6.1-java-buf-io-stream.patch
+@@ -0,0 +1,16 @@
++diff -r src//org/apache/thrift/transport/TSocket.java ../../../thrift-0.6.0-wyk/lib/java/src//org/apache/thrift/transport/TSocket.java
++25a26,27
++> import java.io.BufferedInputStream;
++> import java.io.BufferedOutputStream;
++75,76c77,78
++<         inputStream_ = socket_.getInputStream();
++<         outputStream_ = socket_.getOutputStream();
++---
++>         inputStream_ = new BufferedInputStream(socket_.getInputStream());
++>         outputStream_ = new BufferedOutputStream(socket_.getOutputStream());
++179,180c181,182
++<       inputStream_ = socket_.getInputStream();
++<       outputStream_ = socket_.getOutputStream();
++---
++>       inputStream_ = new BufferedInputStream(socket_.getInputStream());
++>       outputStream_ = new BufferedOutputStream(socket_.getOutputStream());
+-- 
+1.7.9.5
+
+
+From 44f23671fd326e7f23efe1d19e0a5b896e9dd52d Mon Sep 17 00:00:00 2001
+From: "yongkun.wang" <yongkun.wang@mail.rakuten.com>
+Date: Fri, 22 Mar 2013 17:44:02 +0900
+Subject: [PATCH 2/2] clean unused file
+
+---
+ thrift-0.6.1-java-buf-io-stream.patch |   16 ----------------
+ 1 file changed, 16 deletions(-)
+ delete mode 100644 thrift-0.6.1-java-buf-io-stream.patch
+
+diff --git a/thrift-0.6.1-java-buf-io-stream.patch b/thrift-0.6.1-java-buf-io-stream.patch
+deleted file mode 100644
+index 76823a2..0000000
+--- a/thrift-0.6.1-java-buf-io-stream.patch
++++ /dev/null
+@@ -1,16 +0,0 @@
+-diff -r src//org/apache/thrift/transport/TSocket.java ../../../thrift-0.6.0-wyk/lib/java/src//org/apache/thrift/transport/TSocket.java
+-25a26,27
+-> import java.io.BufferedInputStream;
+-> import java.io.BufferedOutputStream;
+-75,76c77,78
+-<         inputStream_ = socket_.getInputStream();
+-<         outputStream_ = socket_.getOutputStream();
+----
+->         inputStream_ = new BufferedInputStream(socket_.getInputStream());
+->         outputStream_ = new BufferedOutputStream(socket_.getOutputStream());
+-179,180c181,182
+-<       inputStream_ = socket_.getInputStream();
+-<       outputStream_ = socket_.getOutputStream();
+----
+->       inputStream_ = new BufferedInputStream(socket_.getInputStream());
+->       outputStream_ = new BufferedOutputStream(socket_.getOutputStream());
+-- 
+1.7.9.5
+
