@@ -1,0 +1,1374 @@
+From ae80b8d574f41c13f045f77bb3683703c4b7ed7f Mon Sep 17 00:00:00 2001
+From: "yongkun.wang" <yongkun.wang@mail.rakuten.com>
+Date: Mon, 25 Mar 2013 16:17:01 +0900
+Subject: [PATCH 1/2] masterless ack
+
+---
+ src/java/com/cloudera/flume/agent/FlumeNode.java   |   21 ++++-
+ .../com/cloudera/flume/agent/WALAckManager.java    |   15 +++
+ .../agent/durability/NaiveFileWALManager.java      |    7 ++
+ .../cloudera/flume/collector/CollectorSink.java    |   38 +++++---
+ .../cloudera/flume/conf/FlumeConfiguration.java    |   19 ++++
+ src/java/com/cloudera/flume/core/Event.java        |    7 ++
+ src/java/com/cloudera/flume/core/EventAck.java     |   72 +++++++++++++++
+ .../com/cloudera/flume/core/EventBaseImpl.java     |   11 +++
+ src/java/com/cloudera/flume/core/EventImpl.java    |   17 +++-
+ .../flume/handlers/avro/AvroEventAdaptor.java      |   10 ++
+ .../handlers/endtoend/AckChecksumChecker.java      |    6 +-
+ .../flume/handlers/endtoend/AckDistributor.java    |   78 ++++++++++++++++
+ .../flume/handlers/endtoend/AckListener.java       |    8 +-
+ .../flume/handlers/endtoend/AckReceiver.java       |   40 ++++++++
+ .../flume/handlers/endtoend/ServiceClient.java     |   46 ++++++++++
+ .../flume/handlers/thrift/AckServiceClient.java    |   97 ++++++++++++++++++++
+ .../flume/handlers/thrift/TStatsTransport.java     |    4 +
+ .../handlers/thrift/ThriftAckDistributor.java      |   79 ++++++++++++++++
+ .../flume/handlers/thrift/ThriftAckReceiver.java   |   64 +++++++++++++
+ .../handlers/thrift/ThriftAckedEventSink.java      |    1 +
+ .../handlers/thrift/ThriftEventAckAdaptor.java     |   37 ++++++++
+ .../flume/handlers/thrift/ThriftEventAdaptor.java  |   12 +++
+ .../flume/handlers/thrift/ThriftEventSink.java     |   73 ++++++++++++++-
+ .../flume/handlers/thrift/ThriftEventSource.java   |   42 +++++++--
+ .../thrift/ThriftFlumeEventServerImpl.java         |    6 ++
+ src/thrift/flume.thrift                            |   10 +-
+ 26 files changed, 793 insertions(+), 27 deletions(-)
+ create mode 100644 src/java/com/cloudera/flume/core/EventAck.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/endtoend/AckDistributor.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/endtoend/AckReceiver.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/endtoend/ServiceClient.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/thrift/AckServiceClient.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/thrift/ThriftAckDistributor.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/thrift/ThriftAckReceiver.java
+ create mode 100644 src/java/com/cloudera/flume/handlers/thrift/ThriftEventAckAdaptor.java
+
+diff --git a/src/java/com/cloudera/flume/agent/FlumeNode.java b/src/java/com/cloudera/flume/agent/FlumeNode.java
+index 94cea8a..60e532e 100644
+--- a/src/java/com/cloudera/flume/agent/FlumeNode.java
++++ b/src/java/com/cloudera/flume/agent/FlumeNode.java
+@@ -54,6 +54,8 @@ import com.cloudera.flume.handlers.endtoend.AckListener;
+ import com.cloudera.flume.handlers.endtoend.CollectorAckListener;
+ import com.cloudera.flume.handlers.text.FormatFactory;
+ import com.cloudera.flume.handlers.text.FormatFactory.OutputFormatBuilder;
++import com.cloudera.flume.handlers.endtoend.AckDistributor;
++import com.cloudera.flume.handlers.endtoend.AckReceiver;
+ import com.cloudera.flume.reporter.MasterReportPusher;
+ import com.cloudera.flume.reporter.NodeReportResource;
+ import com.cloudera.flume.reporter.ReportEvent;
+@@ -123,6 +125,9 @@ public class FlumeNode implements Reportable {
+ 
+   private final ChokeManager chokeMan;
+ 
++  private AckDistributor ackDistributor;
++  private AckReceiver ackReceiver;
++
+   /**
+    * A FlumeNode constructor with pluggable xxxManagers. This is used for
+    * debugging and test cases. The http server is assumed not to be started, and
+@@ -157,7 +162,8 @@ public class FlumeNode implements Reportable {
+     this.physicalNodeName = nodeName;
+     rpcMan = rpc;
+     instance = this;
+-    this.startHttp = startHttp;
++    // ntp 7/6/2011: Going to disable the agent webserver in all cases
++    this.startHttp = false; // startHttp;
+     this.nodesMan = new LogicalNodeManager(nodeName);
+ 
+     File defaultDir = new File(conf.getAgentLogsDir(), getPhysicalNodeName());
+@@ -867,4 +873,17 @@ public class FlumeNode implements Reportable {
+   public FlumeVMInfo getVMInfo() {
+     return vmInfo;
+   }
++
++  public AckDistributor getAckDistributor() {
++    return ackDistributor;
++  }
++  public void setAckDistributor(AckDistributor ackDist) {
++    this.ackDistributor = ackDist;
++  }
++  public AckReceiver getAckReceiver() {
++    return ackReceiver;
++  }
++  public void setAckReceiver(AckReceiver receiver) {
++    this.ackReceiver = receiver;
++  }
+ }
+diff --git a/src/java/com/cloudera/flume/agent/WALAckManager.java b/src/java/com/cloudera/flume/agent/WALAckManager.java
+index 5b14ec2..30b3ef6 100644
+--- a/src/java/com/cloudera/flume/agent/WALAckManager.java
++++ b/src/java/com/cloudera/flume/agent/WALAckManager.java
+@@ -134,6 +134,21 @@ public class WALAckManager implements Reportable {
+   }
+ 
+   /**
++   * This check one ack in the pending acks are completed,
++   */
++  synchronized public void checkAck(String ackid) {
++    LOG.debug("agent acks waiting for master: " + pending);
++
++      try {
++        listener.end(ackid);
++        pending.remove(ackid);
++        LOG.debug("removed ack tag from agent's ack queue: " + ackid);
++      } catch (IOException e) {
++        LOG.error("problem notifying agent pending ack queue", e);
++      }
++  }
++
++  /**
+    * This checks the pending table to see if any acks have been idle for too
+    * long and need to be retried.
+    */
+diff --git a/src/java/com/cloudera/flume/agent/durability/NaiveFileWALManager.java b/src/java/com/cloudera/flume/agent/durability/NaiveFileWALManager.java
+index 7bcf7cc..6b649e0 100644
+--- a/src/java/com/cloudera/flume/agent/durability/NaiveFileWALManager.java
++++ b/src/java/com/cloudera/flume/agent/durability/NaiveFileWALManager.java
+@@ -28,6 +28,7 @@ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.List;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -238,6 +239,12 @@ public class NaiveFileWALManager implements WALManager {
+       ended = true;
+     }
+ 
++  //need to refactor it
++  @Override
++  public void end(String group, List<String> host) throws IOException {
++    this.end(group);
++  }
++
+     @Override
+     public void err(String group) throws IOException {
+       // ignore; detected by lack of end call.
+diff --git a/src/java/com/cloudera/flume/collector/CollectorSink.java b/src/java/com/cloudera/flume/collector/CollectorSink.java
+index ed5bc46..d965ce5 100644
+--- a/src/java/com/cloudera/flume/collector/CollectorSink.java
++++ b/src/java/com/cloudera/flume/collector/CollectorSink.java
+@@ -24,6 +24,7 @@ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.List;
+ 
+ import org.apache.commons.lang.StringEscapeUtils;
+ import org.slf4j.Logger;
+@@ -38,6 +39,7 @@ import com.cloudera.flume.core.CompositeSink;
+ import com.cloudera.flume.core.Event;
+ import com.cloudera.flume.core.EventSink;
+ import com.cloudera.flume.core.EventSinkDecorator;
++import com.cloudera.flume.core.EventAck;
+ import com.cloudera.flume.core.MaskDecorator;
+ import com.cloudera.flume.handlers.debug.InsistentAppendDecorator;
+ import com.cloudera.flume.handlers.debug.InsistentOpenDecorator;
+@@ -69,9 +71,7 @@ public class CollectorSink extends EventSink.Base {
+   final AckListener ackDest;
+   final String snkSpec;
+ 
+-  // This is a container for acks that should be ready for delivery when the
+-  // hdfs sink is closed/flushed
+-  Set<String> rollAckSet = new HashSet<String>();
++  List<EventAck> rollAckList = new ArrayList<EventAck>();
+ 
+   // References package exposed for testing
+   final RollSink roller;
+@@ -169,7 +169,7 @@ public class CollectorSink extends EventSink.Base {
+     }
+ 
+     void flushRollAcks() throws IOException {
+-      AckListener master = ackDest;
++/*      AckListener master = ackDest;
+       Collection<String> acktags;
+       synchronized (rollAckSet) {
+         acktags = new ArrayList<String>(rollAckSet);
+@@ -180,23 +180,39 @@ public class CollectorSink extends EventSink.Base {
+       for (String at : acktags) {
+         master.end(at);
+       }
++*/
++    if ( ! rollAckList.isEmpty() ) {
++      try {
++        FlumeNode.getInstance().getAckDistributor().addAckAll(rollAckList);
++        rollAckList.clear();
++      } catch ( Exception e ) {
++        LOG.info(e.getMessage());
++        e.printStackTrace();
++      }
++    }
+     }
+   };
+ 
+   /**
+-   * This accumulates ack tags in rollAckMap so that they can be pushed to the
++   * This accumulates ack tags in rollAckList so that they can be pushed to the
+    * master when the the hdfs file associated with the rolltag is closed.
+    */
+   class AckAccumulator implements AckListener {
+ 
+-    @Override
+-    public void end(String group) throws IOException {
+-      synchronized (rollAckSet) {
+-        LOG.debug("Adding to acktag {} to rolltag {}", group, curRollTag);
+-        rollAckSet.add(group);
+-        LOG.debug("Current rolltag acktag mapping: {}", rollAckSet);
++    public void end(String group, List<String> host) throws IOException {
++      synchronized (rollAckList) {
++    	  if ( FlumeConfiguration.get().getBoolean("collector.disable.ack", false) == false ) {
++	        LOG.debug("Adding to acktag {} to rolltag {}", group, curRollTag);
++	        EventAck ack = new EventAck(group, host);
++	        rollAckList.add(ack);
++	        LOG.debug("Current rolltag acktag mapping: {}", rollAckList);
++    	  }
+       }
+     }
++  
++  @Override
++  public void end(String group) throws IOException {
++  }
+ 
+     @Override
+     public void err(String group) throws IOException {
+diff --git a/src/java/com/cloudera/flume/conf/FlumeConfiguration.java b/src/java/com/cloudera/flume/conf/FlumeConfiguration.java
+index b12dc58..64e7831 100644
+--- a/src/java/com/cloudera/flume/conf/FlumeConfiguration.java
++++ b/src/java/com/cloudera/flume/conf/FlumeConfiguration.java
+@@ -33,6 +33,7 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import com.cloudera.util.Pair;
++import com.cloudera.flume.handlers.hdfs.AppendRotator;
+ import com.google.common.base.Preconditions;
+ 
+ /**
+@@ -183,6 +184,8 @@ public class FlumeConfiguration extends Configuration {
+   public static final String COLLECTOR_OUTPUT_FORMAT = "flume.collector.output.format";
+   public static final String COLLECTOR_DFS_COMPRESS_GZIP = "flume.collector.dfs.compress.gzip";
+   public static final String COLLECTOR_DFS_COMPRESS_CODEC = "flume.collector.dfs.compress.codec";
++  public static final String COLLECTOR_DFS_APPEND_ENABLED = "dfs.append.enabled";
++  public static final String COLLECTOR_DFS_APPEND_EVENT_COUNT = "dfs.append.event.count";
+ 
+   // TODO(henry) move these to flume.master - they now tell the master which
+   // interface / port to start up on
+@@ -633,6 +636,14 @@ public class FlumeConfiguration extends Configuration {
+     return getLong(COLLECTOR_ROLL_MILLIS, 30000);
+   }
+ 
++  public boolean getDfsAppendEnabled() {
++	return getBoolean(COLLECTOR_DFS_APPEND_ENABLED, false);
++  }
++
++  public long getDfsAppendEventCount() {
++	return getLong(COLLECTOR_DFS_APPEND_EVENT_COUNT, 0);
++  }
++  
+   /**
+    * This is the list of masters that agent nodes will connect to
+    */
+@@ -1042,4 +1053,12 @@ public class FlumeConfiguration extends Configuration {
+     return getLong(NODE_CLOSE_TIMEOUT, 30000);
+   }
+ 
++  AppendRotator appendRotator = null;
++
++  public AppendRotator getAppendRotator() {
++	if ( appendRotator == null ) {
++		appendRotator = new AppendRotator();
++	}
++    return appendRotator;
++  }  
+ }
+diff --git a/src/java/com/cloudera/flume/core/Event.java b/src/java/com/cloudera/flume/core/Event.java
+index 45e04cb..bf29ce2 100644
+--- a/src/java/com/cloudera/flume/core/Event.java
++++ b/src/java/com/cloudera/flume/core/Event.java
+@@ -23,6 +23,7 @@ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
++import java.util.List;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -71,6 +72,12 @@ abstract public class Event {
+    */
+   abstract public String getHost();
+ 
++  // get the host list for acks to route back
++  abstract public List<String> getHostList();
++
++  // add host name to list
++  abstract public void addHostToList(String host);
++
+   /**
+    * This gets a particular attribute added to an event. This an extensible
+    * interface for "other" attributes.
+diff --git a/src/java/com/cloudera/flume/core/EventAck.java b/src/java/com/cloudera/flume/core/EventAck.java
+new file mode 100644
+index 0000000..d28c0b4
+--- /dev/null
++++ b/src/java/com/cloudera/flume/core/EventAck.java
+@@ -0,0 +1,72 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.cloudera.flume.core;
++
++import java.util.List;
++import java.util.ArrayList;
++import java.net.InetAddress;
++import java.net.UnknownHostException;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * The ack for the Event. It contains the ack ID and the hosts list that the
++ * Event has passed by. When Event arrives at the destination, being sunk to 
++ * the hdfs and the sink file is closed, the host list will be passed to the
++ * ack. The reverted list is the route of the ack. The ack will go to the 
++ * original host (the first element of the host list) by this route.
++ */
++public class EventAck {
++  static final Logger LOG = LoggerFactory.getLogger(EventAck.class);
++
++  public String ackID;
++
++  // List of hosts:port the Event has passed by
++  // Reverted list is the route for ack
++  // Each item is a String of "HostName:Port" 
++  public List<String> hostList;
++
++  public EventAck() {
++  }
++
++  public EventAck(String ackID, List<String> hostList) {
++    this.ackID = ackID;
++    this.hostList = hostList;
++  }
++
++  public boolean isDestination() {
++    if ( this.hostList == null || this.hostList.size() == 0 ) return true;
++    return false;
++  }
++
++  public List<String> getHostList() {
++    return this.hostList;
++  }
++
++  public void copy(EventAck ea) {
++    if ( this.hostList == null )
++      this.hostList = new ArrayList<String>();
++
++    this.ackID = ea.ackID;
++    if ( ea.hostList != null ) {
++      for (int i=0; i<ea.hostList.size(); i++)
++        this.hostList.add(ea.hostList.get(i));
++    }
++  }
++}
+diff --git a/src/java/com/cloudera/flume/core/EventBaseImpl.java b/src/java/com/cloudera/flume/core/EventBaseImpl.java
+index 5ad41ec..dce9812 100644
+--- a/src/java/com/cloudera/flume/core/EventBaseImpl.java
++++ b/src/java/com/cloudera/flume/core/EventBaseImpl.java
+@@ -22,8 +22,10 @@ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Map.Entry;
++import java.util.List;
+ 
+ import org.apache.commons.lang.StringEscapeUtils;
++import org.apache.commons.lang.NotImplementedException;
+ 
+ import com.google.common.base.Preconditions;
+ 
+@@ -111,4 +113,13 @@ abstract public class EventBaseImpl extends Event {
+     }    
+   }
+ 
++  @Override
++  public List<String> getHostList() {
++    throw new NotImplementedException();
++  }
++
++  @Override
++  public void addHostToList(String host) {
++    throw new NotImplementedException();
++  }
+ }
+diff --git a/src/java/com/cloudera/flume/core/EventImpl.java b/src/java/com/cloudera/flume/core/EventImpl.java
+index be68e41..84a03d1 100644
+--- a/src/java/com/cloudera/flume/core/EventImpl.java
++++ b/src/java/com/cloudera/flume/core/EventImpl.java
+@@ -25,6 +25,7 @@ import java.util.Map;
+ import java.util.SortedMap;
+ import java.util.TreeMap;
+ import java.util.Map.Entry;
++import java.util.ArrayList;
+ 
+ import org.apache.commons.lang.StringEscapeUtils;
+ 
+@@ -44,6 +45,7 @@ public class EventImpl extends EventBaseImpl {
+   Priority pri;
+   long nanos;
+   String host;
++  List<String> hostList;
+ 
+   final static long MAX_BODY_SIZE = FlumeConfiguration.get()
+       .getEventMaxSizeBytes();
+@@ -62,6 +64,7 @@ public class EventImpl extends EventBaseImpl {
+   public EventImpl(Event e) {
+     this(e.getBody(), e.getTimestamp(), e.getPriority(), e.getNanos(), e
+         .getHost(), new HashMap<String, byte[]>(e.getAttrs()));
++  this.hostList = e.getHostList();
+   }
+ 
+   /**
+@@ -86,7 +89,7 @@ public class EventImpl extends EventBaseImpl {
+       String host) {
+     this(s, timestamp, pri, nanoTime, host, new HashMap<String, byte[]>());
+   }
+-
++  
+   /**
+    * Constructs a new event wrapping (not copying!) the provided byte array
+    */
+@@ -199,4 +202,16 @@ public class EventImpl extends EventBaseImpl {
+     return e2;
+ 
+   }
++
++  @Override
++  public List<String> getHostList() {
++    return this.hostList;
++  }
++
++  @Override
++  public void addHostToList(String host) {
++    if ( hostList == null )
++      hostList = new ArrayList<String>();
++    hostList.add(host);
++  }
+ }
+diff --git a/src/java/com/cloudera/flume/handlers/avro/AvroEventAdaptor.java b/src/java/com/cloudera/flume/handlers/avro/AvroEventAdaptor.java
+index 0644556..ad4f6c8 100644
+--- a/src/java/com/cloudera/flume/handlers/avro/AvroEventAdaptor.java
++++ b/src/java/com/cloudera/flume/handlers/avro/AvroEventAdaptor.java
+@@ -22,6 +22,7 @@ import java.util.Collections;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.List;
+ import org.apache.commons.lang.NotImplementedException;
+ import org.apache.commons.lang.StringEscapeUtils;
+ import com.cloudera.flume.core.Event;
+@@ -178,4 +179,13 @@ class AvroEventAdaptor extends Event {
+   public void merge(Event e) {
+     throw new NotImplementedException();
+   }
++
++  @Override
++  public List<String> getHostList() {
++    throw new NotImplementedException();
++  }
++  @Override
++  public void addHostToList(String host) {
++    throw new NotImplementedException();
++  }
+ }
+diff --git a/src/java/com/cloudera/flume/handlers/endtoend/AckChecksumChecker.java b/src/java/com/cloudera/flume/handlers/endtoend/AckChecksumChecker.java
+index 9cbd506..12427d3 100644
+--- a/src/java/com/cloudera/flume/handlers/endtoend/AckChecksumChecker.java
++++ b/src/java/com/cloudera/flume/handlers/endtoend/AckChecksumChecker.java
+@@ -24,6 +24,7 @@ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.zip.CRC32;
++import java.util.List;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -84,6 +85,9 @@ public class AckChecksumChecker<S extends EventSink> extends
+       public void end(String group) {
+         LOG.info("ended " + group);
+       }
++      public void end(String group, List<String> host) {
++        LOG.info("ended " + group);
++      }
+ 
+       @Override
+       public void err(String group) {
+@@ -153,7 +157,7 @@ public class AckChecksumChecker<S extends EventSink> extends
+       }
+ 
+       LOG.info("Checksum succeeded " + Long.toHexString(chksum));
+-      listener.end(k);
++      listener.end(k, e.getHostList());
+       ackSuccesses.incrementAndGet();
+       partial.remove(k);
+       LOG.info("moved from partial to complete " + k);
+diff --git a/src/java/com/cloudera/flume/handlers/endtoend/AckDistributor.java b/src/java/com/cloudera/flume/handlers/endtoend/AckDistributor.java
+new file mode 100644
+index 0000000..30f29e5
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/endtoend/AckDistributor.java
+@@ -0,0 +1,78 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cloudera.flume.handlers.endtoend;
++
++import java.util.List;
++import java.util.Map;
++import java.util.HashMap;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.LinkedBlockingQueue;
++
++import com.cloudera.flume.conf.FlumeConfiguration;
++import com.cloudera.flume.core.EventAck;
++import com.cloudera.flume.handlers.endtoend.ServiceClient;
++
++import org.apache.commons.lang.NotImplementedException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * This is an ack distributor thread, which will distribute the acks to its next
++ * stop according to the host list in the ThriftEventAck. The connection is the
++ * same connection used for the Event. The connections are stored in queue when
++ * the connection is setup by the Event transmission.
++ */
++public class AckDistributor implements Runnable {
++  private static final Logger LOG = LoggerFactory.getLogger(AckDistributor.class);
++
++  protected final BlockingQueue<EventAck> ackQueue;
++  
++  /*
++   * A map of "HostName:Port" -> ServiceClient
++   */
++  protected final Map<String, ServiceClient> clients;
++
++  public AckDistributor() {
++    this.ackQueue = new LinkedBlockingQueue<EventAck>();
++    this.clients = new HashMap<String, ServiceClient>();
++  }
++
++  public void addClient(ServiceClient client) {	  
++	String clientKey = getHostPortString(client.getHostName(), client.getHostAddress(), client.getPort());
++    clients.put(clientKey, client);
++    LOG.info("Enqueue connection " + clientKey + ", number of connections: " + clients.size());
++  }
++  
++  @Override
++  public void run() {
++    throw new NotImplementedException();
++  }
++
++  public synchronized void addAck(EventAck ack) {
++    ackQueue.add(ack);
++  }
++  public synchronized void addAckAll(List<EventAck> ack) {
++    ackQueue.addAll(ack);
++  }
++  
++  public static String getHostPortString(String hostName, String hostIP, int port) {
++	  boolean useIP = FlumeConfiguration.get().getBoolean("ack.hostlist.using.ip", true);
++	  return ( useIP ? hostIP : hostName ) + ":" + port;
++  }
++}
+diff --git a/src/java/com/cloudera/flume/handlers/endtoend/AckListener.java b/src/java/com/cloudera/flume/handlers/endtoend/AckListener.java
+index 3426cda..630fbdd 100644
+--- a/src/java/com/cloudera/flume/handlers/endtoend/AckListener.java
++++ b/src/java/com/cloudera/flume/handlers/endtoend/AckListener.java
+@@ -18,7 +18,7 @@
+ package com.cloudera.flume.handlers.endtoend;
+ 
+ import java.io.IOException;
+-
++import java.util.List;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -32,6 +32,7 @@ public interface AckListener {
+   public void start(String group) throws IOException;
+ 
+   public void end(String group) throws IOException;
++  public void end(String group, List<String> hostList) throws IOException;
+ 
+   public void err(String group) throws IOException;
+ 
+@@ -46,6 +47,11 @@ public interface AckListener {
+     }
+ 
+     @Override
++    public void end(String group, List<String> hostList) throws IOException {
++      LOG.info("Empty Ack Listener ended " + group);
++    }
++
++    @Override
+     public void err(String group) throws IOException {
+       LOG.info("Empty Ack Listener erred " + group);
+     }
+diff --git a/src/java/com/cloudera/flume/handlers/endtoend/AckReceiver.java b/src/java/com/cloudera/flume/handlers/endtoend/AckReceiver.java
+new file mode 100644
+index 0000000..007ede8
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/endtoend/AckReceiver.java
+@@ -0,0 +1,40 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cloudera.flume.handlers.endtoend;
++
++import org.apache.commons.lang.NotImplementedException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * This is an ack receiver thread, which serves as a server to receive the acks
++ * sent by the AckDistributor. The connection is the same as that used for the
++ * Event transmission.
++ */
++public class AckReceiver implements Runnable {
++  static final Logger LOG = LoggerFactory.getLogger(AckReceiver.class);
++
++  // interval before reconnection, in ms.
++  protected final static int reconnIntvl = 3000;
++
++  @Override
++  public void run() {
++    throw new NotImplementedException();
++  }
++}
+diff --git a/src/java/com/cloudera/flume/handlers/endtoend/ServiceClient.java b/src/java/com/cloudera/flume/handlers/endtoend/ServiceClient.java
+new file mode 100644
+index 0000000..2312242
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/endtoend/ServiceClient.java
+@@ -0,0 +1,46 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cloudera.flume.handlers.endtoend;
++
++/**
++ * connection client for reuse.
++ */
++public interface ServiceClient {
++
++  /**
++   * Get remote hostname, get the canonical hostname 
++   */
++  public String getHostName();
++  
++  /**
++   * Get remote port 
++   */
++  public int getPort();
++  
++  /**
++   * Get ip address of remote host 
++   */
++  public String getHostAddress();
++
++  /**
++   * Send Ack to remote host 
++   */
++  public Object getClient();
++}
++
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/AckServiceClient.java b/src/java/com/cloudera/flume/handlers/thrift/AckServiceClient.java
+new file mode 100644
+index 0000000..649fca9
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/thrift/AckServiceClient.java
+@@ -0,0 +1,97 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cloudera.flume.handlers.thrift;
++
++import org.apache.thrift.protocol.TBinaryProtocol;
++import org.apache.thrift.transport.TSocket;
++import org.apache.thrift.transport.TTransport;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import com.cloudera.flume.handlers.endtoend.ServiceClient;
++
++/**
++ * A wrapper for the connection. The connection is obtained when the Event 
++ * connection is established.
++ * This wrapper class will add more required information such as hostname and port
++ * for ack distributor (AckDistributor) to send the ack back.  
++ */
++public class AckServiceClient implements ServiceClient {
++  static final Logger LOG = LoggerFactory.getLogger(AckServiceClient.class);
++
++  protected final TTransport transport;
++  protected final String addr;
++  protected final String hostName;
++  protected final int port;
++  protected final ThriftFlumeEventServer.Client client;
++
++  public AckServiceClient(TTransport transport) {
++
++    if ( ! transport.getClass().equals(TStatsTransport.class) ) {
++    	String errMsg = String.format("Expecting %s wrapped in %s.", 
++    			TStatsTransport.class.getName(), transport.getClass().getName()
++    			);
++    	LOG.error(errMsg);
++    	throw new Error(errMsg);
++    } 
++    TStatsTransport strans = (TStatsTransport)transport;
++
++    TTransport trans = strans.getTransport();
++
++    if ( ! trans.getClass().equals(TSocket.class) ) {
++    	String errMsg = String.format("Expecting %s wrapped in %s.", 
++                TSocket.class.getName(), trans.getClass().getName()); 
++      LOG.error(errMsg);
++      throw new Error(errMsg);
++    } 
++    TSocket tsocket = (TSocket)trans;
++
++    this.transport = transport;
++    this.client = new ThriftFlumeEventServer.Client(new TBinaryProtocol(transport));
++    this.addr = tsocket.getSocket().getInetAddress().getHostAddress();
++    this.hostName = tsocket.getSocket().getInetAddress().getCanonicalHostName();
++    this.port = tsocket.getSocket().getPort();
++    
++    int localPort = tsocket.getSocket().getLocalPort();
++    LOG.info("Get new client. HostName: " + this.hostName + ", local port: " 
++    		+ localPort + ", remote port: " + this.port);    
++  }
++
++  @Override
++  public String getHostAddress() {
++    return addr;
++  }
++
++  @Override
++  public String getHostName() {
++    return hostName;
++  }
++  
++  @Override
++  public int getPort() {
++    return this.port;
++  }  
++
++  @Override
++  public Object getClient() {	  
++	  	return this.client;
++  }
++}
++
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/TStatsTransport.java b/src/java/com/cloudera/flume/handlers/thrift/TStatsTransport.java
+index fe51223..140bb15 100644
+--- a/src/java/com/cloudera/flume/handlers/thrift/TStatsTransport.java
++++ b/src/java/com/cloudera/flume/handlers/thrift/TStatsTransport.java
+@@ -79,4 +79,8 @@ public class TStatsTransport extends TTransport {
+     return bytesWritten.get();
+   }
+ 
++  // The trans is actually a TSocket
++  public TTransport getTransport() {
++    return trans;
++  }
+ }
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftAckDistributor.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftAckDistributor.java
+new file mode 100644
+index 0000000..7607d88
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftAckDistributor.java
+@@ -0,0 +1,79 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cloudera.flume.handlers.thrift;
++
++import java.util.List;
++
++import com.cloudera.flume.core.EventAck;
++import com.cloudera.flume.handlers.endtoend.AckDistributor;
++
++import com.cloudera.flume.handlers.endtoend.ServiceClient;
++import com.cloudera.flume.handlers.thrift.ThriftFlumeEventServer.Client;
++import com.cloudera.flume.handlers.thrift.ThriftEventAckAdaptor;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Thrift implementation of the AckDistributor.
++ */
++public class ThriftAckDistributor extends AckDistributor {
++  private static final Logger LOG = LoggerFactory.getLogger(ThriftAckDistributor.class);
++
++  public ThriftAckDistributor() {
++    super();
++  }
++  
++  @Override
++  public void run() {
++    while(true) {
++      try {
++        EventAck ack = ackQueue.take();
++
++        List<String> host = ack.hostList;
++        String ackid = ack.ackID;
++
++        int hostListLength = host.size();
++        if ( hostListLength < 1 ) {
++        	LOG.info("No host route for " + ackid);
++        	continue;
++        }
++
++        String hostAndPort = host.get(hostListLength-1);
++        ServiceClient sClient = clients.get(hostAndPort);
++        if ( sClient == null ) {
++        	LOG.error("No connection to " + hostAndPort + " for " + ackid + 
++        			". Please check the host name.");        	        	
++        	//TODO put this ack to a re-try queue
++        	//TODO broadcast this ack with all active connections to that host
++        	continue;
++        }
++        
++        ack.hostList.remove(hostListLength - 1);
++        Client client = (Client)(sClient.getClient());        
++        client.checkAck(ThriftEventAckAdaptor.convert(ack));        
++        LOG.info(String.format("Send ack: %s", ackid));
++
++      } catch (Exception e) {
++        LOG.info(e.getMessage());        
++      }
++    } //end while true
++  }
++
++}
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftAckReceiver.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftAckReceiver.java
+new file mode 100644
+index 0000000..6fa3026
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftAckReceiver.java
+@@ -0,0 +1,64 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cloudera.flume.handlers.thrift;
++
++import com.cloudera.flume.handlers.endtoend.AckReceiver;
++import org.apache.thrift.TException;
++import org.apache.thrift.protocol.TProtocol;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import com.cloudera.flume.handlers.thrift.ThriftFlumeEventServer;
++
++/**
++ * Thrift implementation for AckReceiver.
++ */
++public class ThriftAckReceiver extends AckReceiver {
++  static final Logger LOG = LoggerFactory.getLogger(ThriftAckReceiver.class);
++
++  private final ThriftFlumeEventServer.Processor processor;
++  private final TProtocol protocol;
++
++  // interval before reconnection, in ms.
++  private final static int reconnIntvl = 3000;
++
++  public ThriftAckReceiver(TProtocol protocol, ThriftFlumeEventServer.Iface checkAck) {
++    this.protocol = protocol;
++    this.processor = new ThriftFlumeEventServer.Processor(checkAck);
++  }
++
++  @Override
++  public void run() {
++    while (true) {
++      try {
++        while (processor.process(protocol, protocol) == true) { }
++      } catch (TException te) {
++        LOG.debug(String.format("Connection is broken, " +
++        "sleep %s seconds and connect again...", reconnIntvl/1000));
++        try {
++          Thread.sleep(reconnIntvl);
++        } catch (Exception e) {
++          LOG.info(e.getMessage());
++          e.printStackTrace();
++        }
++      }
++    }
++  }
++}
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftAckedEventSink.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftAckedEventSink.java
+index 459bf1e..a641660 100644
+--- a/src/java/com/cloudera/flume/handlers/thrift/ThriftAckedEventSink.java
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftAckedEventSink.java
+@@ -36,6 +36,7 @@ import com.cloudera.flume.core.Event;
+ import com.cloudera.flume.core.EventImpl;
+ import com.cloudera.flume.core.EventSink;
+ import com.cloudera.flume.handlers.thrift.ThriftFlumeEventServer.Client;
++import com.cloudera.flume.handlers.thrift.EventStatus;
+ 
+ /**
+  * This is a sink that sends events to a remote host/port. The event append rpc
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAckAdaptor.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAckAdaptor.java
+new file mode 100644
+index 0000000..244980f
+--- /dev/null
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAckAdaptor.java
+@@ -0,0 +1,37 @@
++/**
++ * Licensed to Cloudera, Inc. under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  Cloudera, Inc. licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.cloudera.flume.handlers.thrift;
++
++import com.cloudera.flume.core.EventAck;
++import com.cloudera.flume.handlers.thrift.ThriftEventAck;
++
++public class ThriftEventAckAdaptor {
++  public static ThriftEventAck convert(EventAck ea) {
++    ThriftEventAck tea = new ThriftEventAck();
++    tea.ackID = ea.ackID;
++    tea.hostList = ea.hostList;
++    return tea; 
++  }
++
++  public static EventAck convert(ThriftEventAck tea) {
++    EventAck ea = new EventAck();
++    ea.ackID = tea.ackID;
++    ea.hostList = tea.hostList;
++    return ea;
++  }
++}
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAdaptor.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAdaptor.java
+index 346a2a9..8f621cb 100644
+--- a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAdaptor.java
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventAdaptor.java
+@@ -22,6 +22,7 @@ import java.util.Collections;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.List;
+ 
+ import org.apache.commons.lang.NotImplementedException;
+ import org.apache.commons.lang.StringEscapeUtils;
+@@ -128,6 +129,16 @@ class ThriftEventAdaptor extends Event {
+     return evt.getHost();
+   }
+ 
++  @Override
++  public List<String> getHostList() {
++    return evt.getHostList();
++  }
++
++  @Override
++  public void addHostToList(String host) {
++    evt.hostList.add(host);
++  }
++
+   /**
+    * This makes a thrift compatible copy of the event. It is here to encapsulate
+    * future changes to the Event/ThriftFlumeEvent interface
+@@ -140,6 +151,7 @@ class ThriftEventAdaptor extends Event {
+     evt.body = buf;
+     evt.nanos = e.getNanos();
+     evt.host = e.getHost();
++  evt.hostList = e.getHostList();
+ 
+     Map<String, byte[]> tempMap = e.getAttrs();
+     Map<String, ByteBuffer> returnMap = new HashMap<String, ByteBuffer>();
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSink.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSink.java
+index 14b0a2a..659f2eb 100644
+--- a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSink.java
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSink.java
+@@ -19,6 +19,8 @@ package com.cloudera.flume.handlers.thrift;
+ 
+ import java.io.IOException;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.List;
++import java.util.ArrayList;
+ 
+ import org.apache.thrift.TException;
+ import org.apache.thrift.protocol.TBinaryProtocol;
+@@ -36,8 +38,19 @@ import com.cloudera.flume.conf.SinkFactory.SinkBuilder;
+ import com.cloudera.flume.core.Event;
+ import com.cloudera.flume.core.EventImpl;
+ import com.cloudera.flume.core.EventSink;
++import com.cloudera.flume.core.EventAck;
++import com.cloudera.flume.handlers.endtoend.AckDistributor;
++import com.cloudera.flume.handlers.thrift.ThriftFlumeEvent;
++import com.cloudera.flume.handlers.thrift.RawEvent;
+ import com.cloudera.flume.handlers.thrift.ThriftFlumeEventServer.Client;
++import com.cloudera.flume.handlers.thrift.ThriftAckReceiver;
++import com.cloudera.flume.handlers.thrift.ThriftEventAck;
++import com.cloudera.flume.handlers.thrift.ThriftEventAckAdaptor;
++import com.cloudera.flume.handlers.thrift.EventStatus;
+ import com.cloudera.flume.reporter.ReportEvent;
++import com.cloudera.flume.agent.FlumeNode;
++
++import org.apache.commons.lang.NotImplementedException;
+ 
+ /**
+  * This is a sink that sends events to a remote host/port using Thrift.
+@@ -51,7 +64,7 @@ public class ThriftEventSink extends EventSink.Base {
+   final public static String A_SENTBYTES = "sentBytes";
+ 
+   String host;
+-  int port;
++  int port;  
+   Client client;
+   TTransport transport;
+   TStatsTransport stats;
+@@ -73,7 +86,22 @@ public class ThriftEventSink extends EventSink.Base {
+   public void append(Event e) throws IOException, InterruptedException {
+     ThriftFlumeEvent tfe = ThriftEventAdaptor.convert(e);
+     try {
+-      client.append(tfe);
++    	TStatsTransport tst = (TStatsTransport)(client.getOutputProtocol().getTransport());
++        TSocket ts = (TSocket)(tst.getTransport());
++        String hostName = ts.getSocket().getLocalAddress().getCanonicalHostName();
++        String hostIP = ts.getSocket().getLocalAddress().getHostAddress();
++        int localPort = ts.getSocket().getLocalPort();                
++    	
++	    List<String> hostList = tfe.getHostList();
++	    if ( hostList == null ) {
++	      hostList = new ArrayList<String>();
++	    }
++	    hostList.add(AckDistributor.getHostPortString(hostName, hostIP, localPort));
++	    LOG.debug("Append " + 
++	    	AckDistributor.getHostPortString(hostName, hostIP, localPort) + " to event.");
++	    tfe.setHostList(hostList);
++
++	  client.append(tfe);
+       sentBytes.set(stats.getBytesWritten());
+       super.append(e);
+     } catch (TException e1) {
+@@ -111,6 +139,47 @@ public class ThriftEventSink extends EventSink.Base {
+       client = new Client(protocol);
+       LOG.info("ThriftEventSink open on port " + port + " opened");
+ 
++    // Get the ack, if its destination is this host, then send it to 
++    // local wal manager, WALAckManager; if not, add it to the queue of 
++    // ack distributor, AckDistributor.
++    ThriftFlumeEventServer.Iface handler = new ThriftFlumeEventServer.Iface() {
++      @Override
++      public void append(ThriftFlumeEvent evt) throws TException {
++        throw new NotImplementedException();
++      }
++
++      @Override
++      public void rawAppend( RawEvent evt) throws TException {
++        throw new NotImplementedException();
++      }
++
++      @Override
++      public EventStatus ackedAppend( ThriftFlumeEvent evt) throws TException {
++        throw new NotImplementedException();
++      }
++
++      @Override
++      public void close() throws TException {
++        throw new NotImplementedException();
++      }
++      
++      @Override
++      public void checkAck(ThriftEventAck tack) throws TException {
++        LOG.debug("Get ack: " + tack.ackID);
++        EventAck ack = ThriftEventAckAdaptor.convert(tack);
++        if ( ack.isDestination() ) {
++          LOG.info("Get my Ack: " + ack.ackID);
++          FlumeNode.getInstance().getAckChecker().checkAck(ack.ackID);
++        } else {
++          LOG.info("Fwd Ack: " 
++                + ack.ackID);
++          FlumeNode.getInstance().getAckDistributor().addAck(ack);
++        }
++      }
++    };
++    FlumeNode.getInstance().setAckReceiver(new ThriftAckReceiver(protocol, handler));
++    new Thread(FlumeNode.getInstance().getAckReceiver()).start();
++
+     } catch (TTransportException e) {
+       throw new IOException("Failed to open thrift event sink at " + host + ":"
+           + port + " : " + e.getMessage());
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSource.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSource.java
+index 233ed74..35eb4ec 100644
+--- a/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSource.java
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftEventSource.java
+@@ -29,6 +29,10 @@ import org.apache.thrift.protocol.TBinaryProtocol.Factory;
+ import org.apache.thrift.server.TSaneThreadPoolServer;
+ import org.apache.thrift.transport.TSaneServerSocket;
+ import org.apache.thrift.transport.TTransportException;
++import org.apache.thrift.TProcessor;
++import org.apache.thrift.TProcessorFactory;
++import org.apache.thrift.transport.TTransport;
++import org.apache.thrift.transport.TTransportFactory;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -37,8 +41,11 @@ import com.cloudera.flume.conf.FlumeConfiguration;
+ import com.cloudera.flume.conf.SourceFactory.SourceBuilder;
+ import com.cloudera.flume.core.Event;
+ import com.cloudera.flume.core.EventSink;
++import com.cloudera.flume.core.EventSinkDecorator;
+ import com.cloudera.flume.core.EventSource;
+ import com.cloudera.flume.reporter.ReportEvent;
++import com.cloudera.flume.agent.FlumeNode;
++import com.cloudera.flume.handlers.thrift.ThriftAckDistributor;
+ import com.cloudera.util.Clock;
+ import com.google.common.base.Preconditions;
+ 
+@@ -127,20 +134,39 @@ public class ThriftEventSource extends EventSource.Base {
+ 
+     try {
+ 
+-      ThriftFlumeEventServer.Processor processor = new ThriftFlumeEventServer.Processor(
+-          new ThriftFlumeEventServerImpl(new EventSink.Base() {
++	    FlumeNode.getInstance().setAckDistributor(new ThriftAckDistributor());
++	    new Thread(FlumeNode.getInstance().getAckDistributor()).start();
++	    	
++	    Factory protFactory = new TBinaryProtocol.Factory(true, true);
++	
++	    class EventSinkEnqueue extends EventSink.Base {
+             @Override
+             public void append(Event e) throws IOException,
+-                InterruptedException {
++             InterruptedException {
+               enqueue(e);
+               super.append(e);
+             }
+-          }));
+-      Factory protFactory = new TBinaryProtocol.Factory(true, true);
++	    }
++	    // Get the connection when Event connection is established.
++	    // The connection is enqueued and used for sending ack back.
++	    TProcessorFactory processorFactory = new TProcessorFactory(null) {
++	      @Override
++	      public TProcessor getProcessor(TTransport trans) {
++	        LOG.info("Add a client connection to queue.");
++	        FlumeNode.getInstance().getAckDistributor().addClient(
++	                        new AckServiceClient(trans));
++	        return new ThriftFlumeEventServer.Processor<ThriftFlumeEventServerImpl>(
++	            new ThriftFlumeEventServerImpl(new EventSinkEnqueue()));
++	      }
++	    };	
++	
++	    TSaneServerSocket serverTransport = new TSaneServerSocket(port);
++	
++	    server = new TSaneThreadPoolServer(processorFactory, serverTransport, 
++	                      new TTransportFactory(), 
++	                      new TTransportFactory(), 
++	                      protFactory, protFactory);
+ 
+-      TSaneServerSocket serverTransport = new TSaneServerSocket(port);
+-      server = new TSaneThreadPoolServer(processor, serverTransport,
+-          protFactory);
+       LOG.info(String.format(
+           "Starting blocking thread pool server on port %d...", port));
+ 
+diff --git a/src/java/com/cloudera/flume/handlers/thrift/ThriftFlumeEventServerImpl.java b/src/java/com/cloudera/flume/handlers/thrift/ThriftFlumeEventServerImpl.java
+index d9f27cb..b88d9e9 100644
+--- a/src/java/com/cloudera/flume/handlers/thrift/ThriftFlumeEventServerImpl.java
++++ b/src/java/com/cloudera/flume/handlers/thrift/ThriftFlumeEventServerImpl.java
+@@ -28,6 +28,8 @@ import com.cloudera.flume.handlers.hdfs.WriteableEvent;
+ import com.cloudera.flume.handlers.thrift.ThriftFlumeEventServer.Iface;
+ import com.google.common.base.Preconditions;
+ 
++import org.apache.commons.lang.NotImplementedException;
++
+ class ThriftFlumeEventServerImpl implements Iface {
+   private static final Logger LOG = LoggerFactory
+       .getLogger(ThriftFlumeEventServerImpl.class);
+@@ -87,4 +89,8 @@ class ThriftFlumeEventServerImpl implements Iface {
+     }
+   }
+ 
++  @Override
++  public void checkAck(ThriftEventAck ack) throws TException {
++    throw new NotImplementedException();
++  }
+ }
+diff --git a/src/thrift/flume.thrift b/src/thrift/flume.thrift
+index c20c124..b3f5139 100644
+--- a/src/thrift/flume.thrift
++++ b/src/thrift/flume.thrift
+@@ -54,7 +54,8 @@ struct ThriftFlumeEvent {
+   3: binary body,
+   4: i64 nanos,
+   5: string host,
+-  6: map<string,binary> fields
++  6: map<string,binary> fields,
++  7: list<string> hostList,
+ }
+ 
+ # Instead of using thrift's serialization, we just assume the contents are serialized already.
+@@ -62,11 +63,16 @@ struct RawEvent {
+   1: binary raw
+ }
+ 
++struct ThriftEventAck {
++  1: string ackID,
++  2: list<string> hostList,
++}
++
+ service ThriftFlumeEventServer {
+   oneway void append( 1:ThriftFlumeEvent evt ),
+   oneway void rawAppend( 1:RawEvent evt),
+   EventStatus ackedAppend( 1: ThriftFlumeEvent evt ), 
+-    
++  oneway void checkAck(1:ThriftEventAck ack),
+   void close(), 
+ }
+ 
+-- 
+1.7.9.5
+
+
+From dfc9d5bfbab6f204062809f4d032862ba41d7e0c Mon Sep 17 00:00:00 2001
+From: "yongkun.wang" <yongkun.wang@mail.rakuten.com>
+Date: Mon, 25 Mar 2013 16:22:50 +0900
+Subject: [PATCH 2/2] remove comment on startHttp
+
+---
+ src/java/com/cloudera/flume/agent/FlumeNode.java |    3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/java/com/cloudera/flume/agent/FlumeNode.java b/src/java/com/cloudera/flume/agent/FlumeNode.java
+index 60e532e..88fa9b0 100644
+--- a/src/java/com/cloudera/flume/agent/FlumeNode.java
++++ b/src/java/com/cloudera/flume/agent/FlumeNode.java
+@@ -162,8 +162,7 @@ public class FlumeNode implements Reportable {
+     this.physicalNodeName = nodeName;
+     rpcMan = rpc;
+     instance = this;
+-    // ntp 7/6/2011: Going to disable the agent webserver in all cases
+-    this.startHttp = false; // startHttp;
++    this.startHttp = startHttp;
+     this.nodesMan = new LogicalNodeManager(nodeName);
+ 
+     File defaultDir = new File(conf.getAgentLogsDir(), getPhysicalNodeName());
+-- 
+1.7.9.5
+
